@@ -1,333 +1,363 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# ════════════════════════════════════════════════════════════════
+#  inventory.sh  —  System inventory agent
+#  Args: <HOST_IP> <DECRYPT_KEY>
+#  Installs to: /opt/scripts/inventory/inventory.sh
+#  Timer:       driven by ONCALENDAR value from server config
+# ════════════════════════════════════════════════════════════════
+
 VERSION="1.0.5"
 
-# ── Require HOST ──────────────────────────────────────────────────────────────
+# ── Args ──────────────────────────────────────────────────────────────────────
 HOST="${1:-}"
+DECRYPT_KEY="${2:-}"
 
-if [[ -z "$HOST" ]]; then
-  echo "ERROR: Missing HOST."
-  echo "Run host.sh on server and reinstall agent."
+if [[ -z "$HOST" || -z "$DECRYPT_KEY" ]]; then
+  echo "ERROR: Usage: $0 <HOST_IP> <DECRYPT_KEY>"
+  echo "       Get the install command from host.sh output."
   exit 1
 fi
 
-# ── Fetch config blob ─────────────────────────────────────────────────────────
-CONFIG_URL="http://${HOST}:3333/server.env"
-CONFIG="$(curl -fsS "$CONFIG_URL")"
-
-if [[ -z "$CONFIG" ]]; then
-  echo "ERROR: Failed to fetch config from $HOST"
-  exit 1
-fi
-
-# ── Parse config safely ───────────────────────────────────────────────────────
-NC_URL=$(echo "$CONFIG" | grep '^NC_URL=' | cut -d'=' -f2-)
-NC_URL_LOCAL=$(echo "$CONFIG" | grep '^NC_URL_LOCAL=' | cut -d'=' -f2-)
-NC_USER=$(echo "$CONFIG" | grep '^NC_USER=' | cut -d'=' -f2-)
-NC_PASS=$(echo "$CONFIG" | grep '^NC_PASS=' | cut -d'=' -f2-)
-NC_FOLDER=$(echo "$CONFIG" | grep '^NC_FOLDER=' | cut -d'=' -f2-)
-UPDATE_URL=$(echo "$CONFIG" | grep '^UPDATE_URL=' | cut -d'=' -f2-)
-
-# ── Host identity ─────────────────────────────────────────────────────────────
-_HOSTNAME="$(cat /etc/hostname 2>/dev/null || uname -n)"
-NC_FOLDER="$NC_FOLDER/$_HOSTNAME"
-
-# ── Safety check ──────────────────────────────────────────────────────────────
-if [[ -z "$NC_URL" || -z "$NC_USER" || -z "$NC_PASS" ]]; then
-  echo "ERROR: Invalid config received. Reinstall required."
-  exit 1
-fi
-
-# ── Update source ─────────────────────────────────────────────────────────────
-UPDATE_URL="http://${HOST}:3333/inventory.sh"
-SELF="/opt/scripts/inventory/inventory.sh"
-
-# ── Persistence Setup (auto systemd install for inventory) ────────────────
-
-HOST="${HOST:-$1}"
-
-if [[ -z "$HOST" ]]; then
-  echo "ERROR: Missing HOST. Reinstall required."
-  exit 1
-fi
-
+PORT=3333
 INSTALL_BIN="/opt/scripts/inventory/inventory.sh"
 SERVICE_FILE="/etc/systemd/system/inventory.service"
 TIMER_FILE="/etc/systemd/system/inventory.timer"
 
-# ── Install script if missing or outdated ────────────────────────────────────
-if [[ ! -f "$INSTALL_BIN" ]]; then
-  echo "[inventory] installing binary from host..."
-
-  curl -fsSL "http://${HOST}:3333/inventory.sh" -o "$INSTALL_BIN"
-  chmod +x "$INSTALL_BIN"
+# ── Colour helpers ────────────────────────────────────────────────────────────
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'; GRN='\033[0;32m'; YLW='\033[1;33m'
+  CYN='\033[0;36m'; RST='\033[0m'
+else
+  RED=''; GRN=''; YLW=''; CYN=''; RST=''
 fi
 
-# ── Install systemd service (oneshot runner) ─────────────────────────────────
-if [[ ! -f "$SERVICE_FILE" ]]; then
-  cat <<EOF | sudo tee "$SERVICE_FILE" >/dev/null
-[Unit]
-Description=Inventory Script
+info()  { echo -e "${CYN}[inv]${RST} $*"; }
+ok()    { echo -e "${GRN}[inv]${RST} $*"; }
+warn()  { echo -e "${YLW}[inv]${RST} $*" >&2; }
+die()   { echo -e "${RED}[inv] ERROR:${RST} $*" >&2; exit 1; }
+
+# ── Fetch + decrypt config in memory ─────────────────────────────────────────
+#    Downloads server.env.enc, decrypts with the provided key — never writes
+#    the plaintext to disk.  Falls back to local URL if public URL fails.
+fetch_config() {
+  local BASE_URL="http://${HOST}:${PORT}"
+  local ENC_DATA
+
+  ENC_DATA="$(curl -fsSL "${BASE_URL}/server.env.enc")" \
+    || die "Failed to fetch server.env.enc from ${BASE_URL}"
+
+  local PLAIN
+  PLAIN="$(printf '%s' "$ENC_DATA" | \
+    openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -d -a \
+      -pass "pass:${DECRYPT_KEY}" 2>/dev/null)" \
+    || die "Decryption failed — wrong key or corrupted file."
+
+  # Export config vars into current shell
+  while IFS='=' read -r KEY VAL; do
+    [[ -z "$KEY" || "$KEY" == \#* ]] && continue
+    # Strip trailing whitespace/CR
+    VAL="${VAL%$'\r'}"
+    VAL="${VAL%$' '}"
+    export "$KEY"="$VAL"
+  done <<< "$PLAIN"
+}
+
+info "Fetching config from http://${HOST}:${PORT}..."
+fetch_config
+ok  "Config loaded."
+
+# ── Validate required fields ──────────────────────────────────────────────────
+[[ -z "${NC_URL:-}"    ]] && die "Config missing NC_URL"
+[[ -z "${NC_USER:-}"   ]] && die "Config missing NC_USER"
+[[ -z "${NC_PASS:-}"   ]] && die "Config missing NC_PASS"
+[[ -z "${NC_FOLDER:-}" ]] && die "Config missing NC_FOLDER"
+
+# Default schedule if host didn't set one
+ONCALENDAR="${ONCALENDAR:-Mon *-*-* 08:00:00}"
+
+# ── Host identity ─────────────────────────────────────────────────────────────
+_HOSTNAME="$(cat /etc/hostname 2>/dev/null | tr -d '[:space:]' || uname -n)"
+NC_FOLDER="${NC_FOLDER%/}/${_HOSTNAME}"
+
+# ── Self-install to INSTALL_BIN ───────────────────────────────────────────────
+install_self() {
+  local REMOTE_SCRIPT
+  REMOTE_SCRIPT="$(curl -fsSL "http://${HOST}:${PORT}/inventory.sh")" \
+    || { warn "Could not fetch remote inventory.sh — keeping current."; return; }
+
+  local REMOTE_VER
+  REMOTE_VER="$(grep -m1 '^VERSION=' <<< "$REMOTE_SCRIPT" | cut -d'"' -f2)"
+
+  if [[ -f "$INSTALL_BIN" ]] && [[ "$REMOTE_VER" == "$VERSION" ]]; then
+    ok "Already up to date (v${VERSION}) at ${INSTALL_BIN}"
+    return
+  fi
+
+  info "Installing v${REMOTE_VER} → ${INSTALL_BIN}"
+  sudo mkdir -p "$(dirname "$INSTALL_BIN")"
+  printf '%s\n' "$REMOTE_SCRIPT" | sudo tee "$INSTALL_BIN" >/dev/null
+  sudo chmod +x "$INSTALL_BIN"
+  ok "Installed."
+}
+
+# ── Systemd timer + service ───────────────────────────────────────────────────
+install_systemd() {
+  local CHANGED=0
+
+  # ── Service unit ───────────────────────────────────────────────────────────
+  local SVC_WANT
+  SVC_WANT="[Unit]
+Description=Inventory Agent
 
 [Service]
 Type=oneshot
-ExecStart=/opt/scripts/inventory/inventory.sh
-EOF
-fi
+ExecStart=${INSTALL_BIN} ${HOST} ${DECRYPT_KEY}"
 
-# ── Install systemd timer (weekly execution) ─────────────────────────────────
-if [[ ! -f "$TIMER_FILE" ]]; then
-  cat <<EOF | sudo tee "$TIMER_FILE" >/dev/null
-[Unit]
-Description=Run Inventory Weekly
+  if [[ ! -f "$SERVICE_FILE" ]] || \
+     ! diff -q <(echo "$SVC_WANT") "$SERVICE_FILE" >/dev/null 2>&1; then
+    info "Writing ${SERVICE_FILE}"
+    printf '%s\n' "$SVC_WANT" | sudo tee "$SERVICE_FILE" >/dev/null
+    CHANGED=1
+  fi
+
+  # ── Timer unit ─────────────────────────────────────────────────────────────
+  local TIMER_WANT
+  TIMER_WANT="[Unit]
+Description=Run Inventory Agent — ${ONCALENDAR}
 
 [Timer]
-OnCalendar=Mon *-*-* 08:00:00
+OnCalendar=${ONCALENDAR}
 Persistent=true
 
 [Install]
-WantedBy=timers.target
-EOF
-fi
+WantedBy=timers.target"
 
-# ── Enable systemd components ───────────────────────────────────────────────
-sudo systemctl daemon-reload
-sudo systemctl enable --now inventory.timer
+  if [[ ! -f "$TIMER_FILE" ]] || \
+     ! diff -q <(echo "$TIMER_WANT") "$TIMER_FILE" >/dev/null 2>&1; then
+    info "Writing ${TIMER_FILE}"
+    printf '%s\n' "$TIMER_WANT" | sudo tee "$TIMER_FILE" >/dev/null
+    CHANGED=1
+  fi
+
+  if [[ "$CHANGED" -eq 1 ]]; then
+    sudo systemctl daemon-reload
+  fi
+
+  sudo systemctl enable --now inventory.timer
+  ok "Timer active:  $(sudo systemctl status inventory.timer \
+        --no-pager -l 2>/dev/null | grep -E 'Active:|Trigger:' | xargs)"
+}
+
+# ── NC URL resolution ─────────────────────────────────────────────────────────
+resolve_nc_url() {
+  if curl -fsSL --max-time 4 -o /dev/null "${NC_URL}/status.php" 2>/dev/null; then
+    printf '%s' "$NC_URL"
+  elif [[ -n "${NC_URL_LOCAL:-}" ]]; then
+    warn "Public NC unreachable — falling back to ${NC_URL_LOCAL}"
+    printf '%s' "$NC_URL_LOCAL"
+  else
+    die "Nextcloud unreachable at ${NC_URL} and no local fallback set."
+  fi
+}
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 have()  { command -v "$1" >/dev/null 2>&1; }
-
-normalize_dav_path() {
-    echo "${1%/}/"
-}
-
-# Resolve which NC_URL to use — fall back to localhost if DNS fails
-_resolve_nc_url() {
-    if curl -fsSL --max-time 3 -o /dev/null "$NC_URL/status.php" 2>/dev/null; then
-        echo "$NC_URL"
-    else
-        echo "[nc] DNS/TLS failed for $NC_URL — falling back to $NC_URL_LOCAL" >&2
-        echo "$NC_URL_LOCAL"
-    fi
-}
 safe()  { "$@" 2>/dev/null || echo "N/A"; }
 iface() { ip route 2>/dev/null | awk '/default/ {print $5; exit}'; }
 
-# Escape a string for safe embedding in a JSON value
-json_esc() {
-    local s="$1"
-    s="${s//\\/\\\\}"
-    s="${s//\"/\\\"}"
-    s="${s//$'\n'/\\n}"
-    s="${s//$'\r'/\\r}"
-    s="${s//$'\t'/\\t}"
-    printf '%s' "$s"
-}
-
-# ── Self-update ───────────────────────────────────────────────────────────────
-Self-Update() {
-    local TMPFILE
-    TMPFILE="$(mktemp /tmp/inventory.update.XXXXXX)"
-
-    if ! curl -fsSL -o "$TMPFILE" "$UPDATE_URL" 2>/dev/null; then
-        echo "[update] WARNING: Could not reach $UPDATE_URL — continuing with current version." >&2
-        rm -f "$TMPFILE"
-        return
-    fi
-
-    local REMOTE_VER
-    REMOTE_VER=$(grep -m1 '^VERSION=' "$TMPFILE" | cut -d'"' -f2)
-
-    if [[ -z "$REMOTE_VER" ]]; then
-        echo "[update] WARNING: Could not parse remote version — skipping update." >&2
-        rm -f "$TMPFILE"
-        return
-    fi
-
-    if [[ "$REMOTE_VER" == "$VERSION" ]]; then
-        echo "[update] Already up to date (v$VERSION)." >&2
-        rm -f "$TMPFILE"
-        return
-    fi
-
-    echo "[update] New version detected: v$REMOTE_VER (current: v$VERSION) — updating..." >&2
-
-    if sudo cp "$TMPFILE" "$SELF" && sudo chmod +x "$SELF"; then
-        rm -f "$TMPFILE"
-        echo "[update] Update applied. Re-executing..." >&2
-        exec sudo "$SELF" "$@"
-    else
-        echo "[update] ERROR: Failed to write $SELF — check permissions." >&2
-        rm -f "$TMPFILE"
-    fi
-}
+normalize_dav_path() { echo "${1%/}/"; }
 
 # ── WebDAV mkdir -p ───────────────────────────────────────────────────────────
 mkdir_dav() {
-    local path=""
-    IFS='/' read -ra parts <<< "$1"
+  local BASE_DAV="$1"
+  local path=""
+  IFS='/' read -ra parts <<< "$2"
 
-    for p in "${parts[@]}"; do
-        [[ -z "$p" ]] && continue
-        path="$path/$p"
-
-        local url
-        url="$NC_URL/remote.php/dav/files/$NC_USER$(normalize_dav_path "$path")"
-
-        HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
-            -u "$NC_USER:$NC_PASS" \
-            -X MKCOL "$url")
-
-        [[ "$HTTP" =~ ^(201|405|409)$ ]] || {
-            echo "MKCOL failed: $url (HTTP $HTTP)" >&2
-            return 1
-        }
-    done
+  for p in "${parts[@]}"; do
+    [[ -z "$p" ]] && continue
+    path="${path}/${p}"
+    local url
+    url="${BASE_DAV}$(normalize_dav_path "$path")"
+    local HTTP
+    HTTP=$(curl -s -o /dev/null -w "%{http_code}" \
+      -u "${NC_USER}:${NC_PASS}" \
+      -X MKCOL "$url")
+    [[ "$HTTP" =~ ^(201|405|409)$ ]] || {
+      warn "MKCOL failed: $url (HTTP $HTTP)"
+      return 1
+    }
+  done
 }
 
-# ── 🖥 HOST INFO ───────────────────────────────────────────────
+# ── Gather functions ──────────────────────────────────────────────────────────
 Gather-Host() {
-    echo -e "## 🖥 Host Information\n"
-
-    echo "- **Hostname:** $_HOSTNAME"
-    echo "- **OS:** $(uname -s)"
-    echo "- **Kernel:** $(uname -r)"
-    echo "- **Architecture:** $(uname -m)"
-
-    CPU=$(lscpu 2>/dev/null | awk -F: '/Model name/ {print $2}' | xargs)
-    RAM=$(free -h 2>/dev/null | awk '/Mem:/ {print $2}')
-
-    echo "- **CPU:** ${CPU:-N/A}"
-    echo "- **RAM:** ${RAM:-N/A}"
-    echo
+  echo -e "## 🖥 Host Information\n"
+  echo "- **Hostname:** $_HOSTNAME"
+  echo "- **OS:** $(uname -s)"
+  echo "- **Kernel:** $(uname -r)"
+  echo "- **Architecture:** $(uname -m)"
+  local CPU RAM
+  CPU=$(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^[[:space:]]+/,"",$2); print $2}')
+  RAM=$(free -h 2>/dev/null | awk '/Mem:/ {print $2}')
+  echo "- **CPU:** ${CPU:-N/A}"
+  echo "- **RAM:** ${RAM:-N/A}"
+  echo "- **Uptime:** $(uptime -p 2>/dev/null || uptime)"
+  echo ""
 }
 
-# ── 👤 USER INFO ──────────────────────────────────────────────
 Gather-User() {
-    echo -e "## 👤 User Information\n"
-
-    echo "- **Current User:** $(whoami)"
-    echo "- **Groups:** $(groups)"
-    echo "- **All Users:** $(cut -d: -f1 /etc/passwd | paste -sd, -)"
-
-    echo -e "\n### 🔐 Sudo Access"
-    sudo -n -l 2>/dev/null || echo "sudo requires password / unavailable"
-    echo
+  echo -e "## 👤 User Information\n"
+  echo "- **Current User:** $(whoami)"
+  echo "- **Groups:** $(groups)"
+  echo "- **All Users:** $(cut -d: -f1 /etc/passwd | paste -sd, -)"
+  echo ""
+  echo "### 🔐 Sudo Access"
+  echo '```'
+  sudo -n -l 2>/dev/null || echo "sudo requires password / unavailable"
+  echo '```'
+  echo ""
 }
 
-# ── 🌐 NETWORK INFO ───────────────────────────────────────────
 Gather-Network() {
-    echo -e "## 🌐 Network Information\n"
-
-    echo "- **Interface:** $(iface)"
-    echo "- **IP Addresses:** $(ip -o addr show | awk '{print $4}' | paste -sd, -)"
-    echo "- **MAC Addresses:** $(ip link | awk '/ether/ {print $2}' | paste -sd, -)"
-    echo "- **Gateway:** $(ip route | awk '/default/ {print $3; exit}')"
-
-    echo -e "\n### DNS"
-    echo "- resolv.conf: $(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd, -)"
-
-    echo -e "\n### 🔌 Listening Ports"
-    echo '```'
-    safe ss -tulpn
-    echo '```'
-    echo
+  echo -e "## 🌐 Network Information\n"
+  echo "- **Interface:** $(iface)"
+  echo "- **IP Addresses:** $(ip -o addr show 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+  echo "- **MAC Addresses:** $(ip link 2>/dev/null | awk '/ether/ {print $2}' | paste -sd, -)"
+  echo "- **Gateway:** $(ip route 2>/dev/null | awk '/default/ {print $3; exit}')"
+  echo ""
+  echo "### DNS"
+  echo "- resolv.conf: $(grep nameserver /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd, -)"
+  echo ""
+  echo "### 🔌 Listening Ports"
+  echo '```'
+  safe ss -tulpn
+  echo '```'
+  echo ""
 }
 
-# ── 🧱 VIRTUALIZATION ─────────────────────────────────────────
 Gather-Virtualization() {
-    echo -e "## 🧱 Virtualization\n"
+  echo -e "## 🧱 Virtualization\n"
+  local found=0
 
-    if have docker; then
-        echo "### 🐳 Docker"
-        echo '```'
-        sudo docker ps -a 2>/dev/null
-        echo '```'
-        echo
-    fi
+  if have docker; then
+    found=1
+    echo "### 🐳 Docker"
+    echo '```'
+    sudo docker ps -a 2>/dev/null
+    echo '```'
+    echo ""
+  fi
 
-    if have virsh; then
-        echo "### 🖥 Libvirt"
-        echo '```'
-        sudo virsh list --all 2>/dev/null
-        echo '```'
-        echo
-    fi
+  if have virsh; then
+    found=1
+    echo "### 🖥 Libvirt"
+    echo '```'
+    sudo virsh list --all 2>/dev/null
+    echo '```'
+    echo ""
+  fi
 
-    if have pct; then
-        echo "### 📦 LXC (Proxmox)"
-        echo '```'
-        sudo pct list 2>/dev/null
-        echo '```'
-        echo
-    elif have lxc-ls; then
-        echo "### 📦 LXC"
-        echo '```'
-        sudo lxc-ls --fancy 2>/dev/null
-        echo '```'
-        echo
-    fi
+  if have pct; then
+    found=1
+    echo "### 📦 LXC (Proxmox)"
+    echo '```'
+    sudo pct list 2>/dev/null
+    echo '```'
+    echo ""
+  elif have lxc-ls; then
+    found=1
+    echo "### 📦 LXC"
+    echo '```'
+    sudo lxc-ls --fancy 2>/dev/null
+    echo '```'
+    echo ""
+  fi
+
+  [[ "$found" -eq 0 ]] && echo "_No container/VM runtime detected._" && echo ""
 }
 
-# ── Upload ─────────────────────────────────────────────────────
+Gather-Disks() {
+  echo -e "## 💾 Disk Usage\n"
+  echo '```'
+  df -h 2>/dev/null
+  echo '```'
+  echo ""
+}
+
+# ── Upload report to Nextcloud ────────────────────────────────────────────────
 Upload-Report() {
-    local FILE="$1"
-    local DATA="$2"
-    local TMPFILE="/tmp/$FILE"
-    local BASE="$NC_URL/remote.php/dav/files/$NC_USER/$(normalize_dav_path "$NC_FOLDER")"
+  local ACTIVE_URL="$1"
+  local FILE="$2"
+  local DATA="$3"
 
-    mkdir_dav "$NC_FOLDER" || return 1
+  local BASE_DAV="${ACTIVE_URL}/remote.php/dav/files/${NC_USER}"
 
-    printf "%s\n" "$DATA" > "$TMPFILE"
-    echo "Saved:     $TMPFILE"
-    echo "Uploading: $BASE/$FILE"
+  # Ensure remote directory exists
+  mkdir_dav "$BASE_DAV" "$NC_FOLDER" || return 1
 
-    local HTTP_STATUS
-    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-        -u "$NC_USER:$NC_PASS" -T "$TMPFILE" "$BASE/$FILE")
+  local REMOTE_PATH
+  REMOTE_PATH="${BASE_DAV}/$(normalize_dav_path "$NC_FOLDER")${FILE}"
 
-    echo "HTTP=$HTTP_STATUS"
+  local HTTP_STATUS
+  HTTP_STATUS=$(printf '%s\n' "$DATA" | \
+    curl -s -o /dev/null -w "%{http_code}" \
+      -u "${NC_USER}:${NC_PASS}" \
+      -T - \
+      "$REMOTE_PATH")
 
-    if [[ "$HTTP_STATUS" =~ ^(201|204)$ ]]; then
-        echo "Uploaded:  $NC_FOLDER/$FILE"
-        rm -f "$TMPFILE"
-    else
-        echo "Upload failed (HTTP $HTTP_STATUS)" >&2
-        return 1
-    fi
+  if [[ "$HTTP_STATUS" =~ ^(201|204)$ ]]; then
+    ok "Uploaded → ${NC_FOLDER}/${FILE}  (HTTP ${HTTP_STATUS})"
+  else
+    warn "Upload failed (HTTP ${HTTP_STATUS}) — check NC credentials/URL"
+    return 1
+  fi
 }
 
-# ── MAIN REPORT BUILDER ───────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 Main() {
-    Self-Update "$@"
-    NC_URL=$(_resolve_nc_url)
+  # 1. Ensure this script is installed and up-to-date
+  install_self
 
-    TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+  # 2. Ensure systemd timer is in place (schedule from config)
+  install_systemd
 
-    REPORT=$(
-        cat <<EOF
+  # 3. Resolve which Nextcloud URL to use
+  local ACTIVE_NC_URL
+  ACTIVE_NC_URL="$(resolve_nc_url)"
+
+  # 4. Build report
+  local TIMESTAMP
+  TIMESTAMP="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+
+  local REPORT
+  REPORT=$(cat <<EOF
 # 🧾 System Inventory Report
 
-- **Version:** $VERSION  
-- **Timestamp:** $TIMESTAMP  
-- **Host:** $_HOSTNAME  
+| Field      | Value |
+|------------|-------|
+| **Version**   | ${VERSION} |
+| **Timestamp** | ${TIMESTAMP} |
+| **Host**      | ${_HOSTNAME} |
+| **Schedule**  | ${ONCALENDAR} |
 
 ---
 
 $(Gather-Host)
 $(Gather-User)
 $(Gather-Network)
+$(Gather-Disks)
 $(Gather-Virtualization)
 
 ---
-
-
 EOF
 )
 
-    FILE="$_HOSTNAME-$(date +%Y-%m-%d_%H-%M-%S).md"
+  # 5. Print locally
+  echo "$REPORT"
 
-    echo "$REPORT"
-    Upload-Report "$FILE" "$REPORT"
+  # 6. Upload
+  local FILE="${_HOSTNAME}-$(date +%Y-%m-%d_%H-%M-%S).md"
+  Upload-Report "$ACTIVE_NC_URL" "$FILE" "$REPORT"
 }
 
 Main "$@"
