@@ -18,11 +18,13 @@ if [[ ! -f "./server.env" ]]; then
 
   read -rp "Nextcloud URL (https://cloud.example.com): " NC_URL
   read -rp "Nextcloud bot username: " NC_USER
-  read -rp "Nextcloud app password: " NC_PASS
+  read -rsp "Nextcloud app password: " NC_PASS # dont display password
+  echo 
   read -rp "Nextcloud folder path (/Systems): " NC_FOLDER
   echo ""
   echo "Saving configuration..."
 
+  umask 077
   cat > server.env <<EOF
 NC_URL=$NC_URL
 NC_USER=$NC_USER
