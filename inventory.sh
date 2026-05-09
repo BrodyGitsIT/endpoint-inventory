@@ -70,7 +70,7 @@ Description=Inventory Script
 
 [Service]
 Type=oneshot
-ExecStart=/usropt/scripts/inventory/inventory.sh
+ExecStart=/opt/scripts/inventory/inventory.sh
 EOF
 fi
 
