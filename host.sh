@@ -37,6 +37,18 @@ fi
 
 source ./server.env
 
+echo "[host] installing files..."
+sudo mkdir -p "$INSTALL_DIR"
+sudo cp ./inventory.sh "$INSTALL_DIR/"
+sudo cp ./server.env "$INSTALL_DIR/"
+
+sudo chmod +x "$INSTALL_DIR/inventory.sh"
+sudo chmod 600 "$INSTALL_DIR/server.env"
+sudo chown root:root "$INSTALL_DIR/"*
+
+echo "[host] files installed:"
+sudo ls -lah "$INSTALL_DIR"
+
 # ── System identity ───────────────────────────────────────────────────────────
 _HOSTNAME="$(cat /etc/hostname 2>/dev/null || uname -n)"
 HOST_IP="${HOST_IP:-$(ip route get 1.1.1.1 | awk '{print $7; exit}')}"
