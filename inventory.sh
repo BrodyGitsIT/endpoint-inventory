@@ -39,7 +39,7 @@ fi
 
 # ── Update source ─────────────────────────────────────────────────────────────
 UPDATE_URL="http://${HOST}:3333/inventory.sh"
-SELF="/usr/local/bin/inventory.sh"
+SELF="/opt/scripts/inventory/inventory.sh"
 
 # ── Persistence Setup (auto systemd install for inventory) ────────────────
 
@@ -50,7 +50,7 @@ if [[ -z "$HOST" ]]; then
   exit 1
 fi
 
-INSTALL_BIN="/usr/local/bin/inventory.sh"
+INSTALL_BIN="/opt/scripts/inventory/inventory.sh"
 SERVICE_FILE="/etc/systemd/system/inventory.service"
 TIMER_FILE="/etc/systemd/system/inventory.timer"
 
